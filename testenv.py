@@ -119,29 +119,29 @@ class NewRobotsSceneCfg(InteractiveSceneCfg):
     )
 
     left_camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/robot/endeffector/left_camera",
+        prim_path="{ENV_REGEX_NS}/Robot/robot/endeffector/MeshInstance_4/left_camera",
         spawn=None,
         update_period=0.1,
-        height=480,
-        width=640,
+        height=960,
+        width=1280,
         data_types=["rgb"],
     )
 
     right_camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/robot/endeffector/right_camera",
+        prim_path="{ENV_REGEX_NS}/Robot/robot/endeffector/MeshInstance_4/right_camera",
         spawn=None,
         update_period=0.1,
-        height=480,
-        width=640,
+        height=960,
+        width=1280,
         data_types=["rgb"],
     )
 
     middle_camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/robot/endeffector/middle_camera",
+        prim_path="{ENV_REGEX_NS}/Robot/robot/endeffector/MeshInstance_4/middle_camera",
         spawn=None,
         update_period=0.1,
-        height=480,
-        width=640,
+        height=960,
+        width=1280,
         data_types=["rgb"],
     )
 
@@ -161,9 +161,9 @@ class NewRobotsSceneCfg(InteractiveSceneCfg):
         prim_path = "{ENV_REGEX_NS}/Box/AprilTag",
         spawn=sim_utils.UsdFileCfg(
             usd_path="/home/sdl6/simulation/IsaacLab/source/isaaclab/isaaclab/pf400/AprilTag_ID2.usd",
-            scale=(0.005,0.005,0.005),
+            scale=(0.001,0.001,0.001),
         ),
-        init_state = AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.282, 0.3), rot=(0.7071,-0.7071,0,0)),
+        init_state = AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.2505, 0.3), rot=(0.7071,-0.7071,0,0)),
     )
 
 
@@ -195,7 +195,140 @@ def grab_camera(scene, cam_name):
     return rgb, K
 
 
-TAG_SIZE = 0.12012
+TAG_SIZE = 0.024024
+CAM_OUT_DIR = "/home/sdl6/simulation/IsaacLab/scripts/digitaltwin/cam"
+
+
+class TagDetector:
+
+    FAMILIES = "tag36h11"
+
+    def __init__(self, tag_size=TAG_SIZE, families=FAMILIES, nthreads=4,
+                 quad_decimate=1.0, quad_sigma=0.0, refine_edges=1,
+                 decode_sharpening=0.25, debug=0, out_dir=CAM_OUT_DIR):
+        from pyapriltags import Detector as AprilTagDetector
+        self.tag_size = tag_size
+        self.out_dir = out_dir
+        self.detector = AprilTagDetector(
+            families=families,
+            nthreads=nthreads,
+            quad_decimate=quad_decimate,
+            quad_sigma=quad_sigma,
+            refine_edges=refine_edges,
+            decode_sharpening=decode_sharpening,
+            debug=debug,
+        )
+
+    @staticmethod
+    def to_gray(rgb):
+        g = np.dot(rgb[..., :3].astype(np.float32), [0.299, 0.587, 0.114]).astype(np.uint8)
+        return np.ascontiguousarray(g)
+
+    def detect_frame(self, gray, camera_params, tag_size=None):
+        return self.detector.detect(
+            gray,
+            estimate_tag_pose=True,
+            camera_params=camera_params,
+            tag_size=self.tag_size if tag_size is None else tag_size,
+        )
+
+    def detect_camera(self, scene, cam_name, tag_size=None, save_overlay=True, verbose=True):
+        result = grab_camera(scene, cam_name)
+        if result is None:
+            if verbose:
+                print(f"  [{cam_name}] no frame yet")
+            return []
+        rgb, K = result
+
+        T_world_cam = live_camera_matrix(scene, cam_name)
+        params = (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2]))
+        dets = self.detect_frame(self.to_gray(rgb), params, tag_size)
+
+        if not dets and verbose:
+            print(f"  [{cam_name}] no tags detected")
+
+        out = []
+        for d in dets:
+            t_cam = np.asarray(d.pose_t).flatten()
+            T_cam_tag = np.eye(4)
+            T_cam_tag[:3, :3] = d.pose_R
+            T_cam_tag[:3, 3] = t_cam
+            T = T_world_cam @ T_cam_tag
+            out.append({
+                "tag_id": int(d.tag_id),
+                "camera": cam_name,
+                "pose_t": t_cam,
+                "pose_R": np.asarray(d.pose_R),
+                "distance": float(np.linalg.norm(t_cam)),
+                "pose_err": float(d.pose_err),
+                "center_px": np.asarray(d.center, dtype=float),
+                "corners_px": np.asarray(d.corners, dtype=float),
+                "T_world_tag": T,
+                "normal_world": T[:3, 2],
+            })
+            if verbose:
+                print(f"  [{cam_name}] tag {d.tag_id}: dist={np.linalg.norm(t_cam):.4f}m  "
+                      f"world={np.round(T[:3, 3], 4).tolist()}")
+
+        if save_overlay:
+            self.save_overlay(rgb, out, cam_name)
+        return out
+
+    def save_overlay(self, rgb, detections, cam_name):
+        from PIL import Image, ImageDraw
+        vis = Image.fromarray(rgb.astype(np.uint8))
+        draw = ImageDraw.Draw(vis)
+        h, w = rgb.shape[0], rgb.shape[1]
+        img_center = (w / 2.0, h / 2.0)
+        for det in detections:
+            corners = [tuple(map(float, c)) for c in det["corners_px"]]
+            draw.line(corners + [corners[0]], fill=(0, 255, 0), width=3)
+            cx_, cy_ = float(det["center_px"][0]), float(det["center_px"][1])
+            draw.ellipse([cx_ - 4, cy_ - 4, cx_ + 4, cy_ + 4], fill=(255, 0, 0))
+            draw.line([img_center, (cx_, cy_)], fill=(0, 128, 255), width=1)
+            dx, dy = cx_ - img_center[0], cy_ - img_center[1]
+            draw.text((cx_ + 6, cy_ - 22), f"ID {det['tag_id']}", fill=(255, 255, 0))
+            draw.text((cx_ + 6, cy_ - 10),
+                      f"dx {dx:+.0f} dy {dy:+.0f}  {det['distance']:.3f}m",
+                      fill=(255, 255, 0))
+        vis.save(f"{self.out_dir}/detect_{cam_name}.png")
+
+    @staticmethod
+    def _median_pose(mats):
+        positions = np.stack([T[:3, 3] for T in mats])
+        pos = np.median(positions, axis=0)
+        rot = np.median(np.stack([T[:3, :3] for T in mats]), axis=0)
+        U, _, Vh = np.linalg.svd(rot)
+        rot = U @ Vh
+        if np.linalg.det(rot) < 0:
+            U[:, -1] *= -1
+            rot = U @ Vh
+        spread = float(np.linalg.norm(positions - pos, axis=1).max()) if len(mats) > 1 else 0.0
+        T = np.eye(4)
+        T[:3, :3] = rot
+        T[:3, 3] = pos
+        return T, spread
+
+    def detect_all(self, scene, tag_size=None, cameras=None, verbose=True):
+        by_tag = {}
+        for name in (cameras or CAMERA_NAMES):
+            for det in self.detect_camera(scene, name, tag_size, verbose=verbose):
+                by_tag.setdefault(det["tag_id"], []).append(det)
+
+        fused = {}
+        for tag_id, dets in by_tag.items():
+            T, spread = self._median_pose([d["T_world_tag"] for d in dets])
+            fused[tag_id] = {
+                "tag_id": tag_id,
+                "T_world_tag": T,
+                "position": T[:3, 3],
+                "normal_world": T[:3, 2],
+                "cameras": len(dets),
+                "spread": spread,
+                "detections": dets,
+            }
+        return fused
+
 
 _detector = None
 
@@ -203,13 +336,7 @@ _detector = None
 def get_detector():
     global _detector
     if _detector is None:
-        from pyapriltags import Detector
-        _detector = Detector(
-            families="tag36h11",
-            nthreads=4,
-            quad_decimate=1.0,
-            refine_edges=True,
-        )
+        _detector = TagDetector()
     return _detector
 
 
@@ -233,6 +360,28 @@ def _ee_matrix(scene):
     )
 
 
+def _stage_world_transform(prim_name, orthonormalize=True):
+    import omni.usd
+    from pxr import UsdGeom
+    stage = omni.usd.get_context().get_stage()
+    for prim in stage.Traverse():
+        if prim.GetName() == prim_name:
+            m = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0.0)
+            raw = np.array([[m[j][i] for j in range(4)] for i in range(4)])
+            if not orthonormalize:
+                return raw
+            U, _, Vh = np.linalg.svd(raw[:3, :3])
+            R = U @ Vh
+            if np.linalg.det(R) < 0:
+                U[:, -1] *= -1
+                R = U @ Vh
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3] = raw[:3, 3]
+            return T
+    return None
+
+
 def calibrate_camera_mount(scene):
     global _ee_idx, _T_ee_cam
     robot = scene["pf400"]
@@ -253,84 +402,31 @@ def calibrate_camera_mount(scene):
     print(f"  [mount] captured offsets for: {list(_T_ee_cam.keys())}")
 
 
+
 def live_camera_matrix(scene, cam_name):
     return _ee_matrix(scene) @ _T_ee_cam[cam_name]
 
 
-def detect_one_camera(scene, cam_name, tag_size, detector):
-    result = grab_camera(scene, cam_name)
-    if result is None:
-        print(f"  [{cam_name}] no frame yet")
-        return []
-    rgb, K = result
-
-    T_world_cam = live_camera_matrix(scene, cam_name)
-
-    gray = np.dot(rgb[..., :3].astype(np.float32), [0.299, 0.587, 0.114]).astype(np.uint8)
-    gray = np.ascontiguousarray(gray)
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    dets = detector.detect(
-        gray,
-        estimate_tag_pose=True,
-        camera_params=(float(fx), float(fy), float(cx), float(cy)),
-        tag_size=tag_size,
-    )
-
-    from PIL import Image, ImageDraw
-    vis = Image.fromarray(rgb.astype(np.uint8))
-    draw = ImageDraw.Draw(vis)
-
-    out = []
-    if not dets:
-        print(f"  [{cam_name}] no tags detected")
-    for d in dets:
-        t_cam = np.asarray(d.pose_t).flatten()
-        T_cam_tag = np.eye(4)
-        T_cam_tag[:3, :3] = d.pose_R
-        T_cam_tag[:3, 3] = t_cam
-        T = T_world_cam @ T_cam_tag
-        out.append((int(d.tag_id), T, float(d.pose_err)))
-        print(f"  [{cam_name}] tag {d.tag_id}: dist={np.linalg.norm(t_cam):.4f}m  "
-              f"world={np.round(T[:3, 3], 4).tolist()}")
-
-        corners = [tuple(map(float, c)) for c in np.asarray(d.corners)]
-        draw.line(corners + [corners[0]], fill=(0, 255, 0), width=3)
-        cx_, cy_ = float(d.center[0]), float(d.center[1])
-        draw.ellipse([cx_ - 4, cy_ - 4, cx_ + 4, cy_ + 4], fill=(255, 0, 0))
-        draw.text((cx_ + 6, cy_ - 10), f"ID {d.tag_id}", fill=(255, 255, 0))
-
-    vis.save(f"/home/sdl6/simulation/IsaacLab/scripts/digitaltwin/cam/detect_{cam_name}.png")
-    return out
+def detect_one_camera(scene, cam_name, tag_size, detector=None):
+    det = detector if isinstance(detector, TagDetector) else get_detector()
+    return [(d["tag_id"], d["T_world_tag"], d["pose_err"])
+            for d in det.detect_camera(scene, cam_name, tag_size)]
 
 
 def fused_tag_poses(scene, tag_size):
-    from scipy.spatial.transform import Rotation as R
-    detector = get_detector()
-
-    by_tag = {}
-    for name in CAMERA_NAMES:
-        for tag_id, T, _err in detect_one_camera(scene, name, tag_size, detector):
-            by_tag.setdefault(tag_id, []).append(T)
-
-    fused = {}
-    for tag_id, mats in by_tag.items():
-        positions = np.stack([T[:3, 3] for T in mats])
-        pos_avg = positions.mean(axis=0)
-        rot_avg = R.from_matrix(np.stack([T[:3, :3] for T in mats])).mean().as_matrix()
-        spread = float(np.linalg.norm(positions - pos_avg, axis=1).max()) if len(mats) > 1 else 0.0
-        F = np.eye(4)
-        F[:3, :3] = rot_avg
-        F[:3, 3] = pos_avg
-        fused[tag_id] = (F, len(mats), spread)
-    return fused
+    fused = get_detector().detect_all(scene, tag_size)
+    return {tid: (f["T_world_tag"], f["cameras"], f["spread"]) for tid, f in fused.items()}
 
 
 def detect_tags(scene, tag_size):
     from scipy.spatial.transform import Rotation as R
-    for tag_id, (F, n, spread) in fused_tag_poses(scene, tag_size).items():
-        euler = R.from_matrix(F[:3, :3]).as_euler("xyz", degrees=True)
-        print(f"  FUSED tag {tag_id} ({n} cam): pos={np.round(F[:3, 3], 4).tolist()}  "
-              f"rot(xyz deg)={np.round(euler, 1).tolist()}  cam_spread={spread:.4f}m")
+    for tag_id, f in get_detector().detect_all(scene, tag_size).items():
+        euler = R.from_matrix(f["T_world_tag"][:3, :3]).as_euler("xyz", degrees=True)
+        print(f"  FUSED tag {tag_id} ({f['cameras']} cam): "
+              f"pos={np.round(f['position'], 4).tolist()}  "
+              f"rot(xyz deg)={np.round(euler, 1).tolist()}  "
+              f"normal={np.round(f['normal_world'], 3).tolist()}  "
+              f"cam_spread={f['spread']:.4f}m")
 
 
 import math
@@ -462,9 +558,11 @@ class PF400Kinematics:
 
 _kin = PF400Kinematics()
 
+_EE_TWIST_DEG = 0.0
+
 _A1_REST = _link_ang_deg(_P_SHOULDER, _P_ELBOW)
 _A2_REST = _link_ang_deg(_P_ELBOW, _P_WRIST)
-_A3_REST = _link_ang_deg(_P_WRIST, _P_EE)
+_A3_REST = _link_ang_deg(_P_WRIST, _P_EE) + _EE_TWIST_DEG
 
 J2_OFFSET = _A1_REST
 J3_OFFSET = _A2_REST - _A1_REST
@@ -587,7 +685,7 @@ def goal_pose_from_tag(T_world_tag, standoff, off_x, off_y, cam_name="middle_cam
     T_ec = _T_ee_cam[cam_name]
     fwd_ee = T_ec[:3, 2]
     alpha = math.atan2(fwd_ee[1], fwd_ee[0])
-    d = p - cam_target
+    d = -s * n
     theta = math.atan2(d[1], d[0]) - alpha
 
     off_ee = T_ec[:3, 3]
@@ -943,6 +1041,17 @@ def run_simulator(
                     print(f"  [camcheck] {name:14s} pos={np.round(T[:3,3],4).tolist()}")
                     print(f"               rot(xyz deg)={np.round(eul,1).tolist()}  "
                           f"fwd={np.round(T[:3,2],3).tolist()}")
+                    Tw = live_camera_matrix(scene, name)
+                    fwd_w, up_cam = Tw[:3, 2], -Tw[:3, 1]
+                    wu = np.array([0.0, 0.0, 1.0]) - np.dot([0.0, 0.0, 1.0], fwd_w) * fwd_w
+                    n_wu = np.linalg.norm(wu)
+                    if n_wu > 1e-6:
+                        wu = wu / n_wu
+                        roll = math.degrees(math.atan2(
+                            float(np.dot(np.cross(wu, up_cam), fwd_w)),
+                            float(np.dot(wu, up_cam))))
+                        print(f"               roll about optical axis vs world up: "
+                              f"{roll:+.2f} deg")
                 fwds = [_T_ee_cam[n][:3, 2] for n in CAMERA_NAMES if n in _T_ee_cam]
                 if len(fwds) == 3:
                     for a, b in ((0, 1), (0, 2), (1, 2)):
@@ -951,32 +1060,14 @@ def run_simulator(
                         print(f"  [camcheck] angle {CAMERA_NAMES[a]} vs "
                               f"{CAMERA_NAMES[b]}: {ang:.1f} deg")
 
-                print("  --- from the USD stage (authoritative) ---")
-                import omni.usd
-                from pxr import UsdGeom
-                stage = omni.usd.get_context().get_stage()
-                looks = {}
-                for prim in stage.Traverse():
-                    if prim.GetName() not in CAMERA_NAMES:
+                print("  --- USD stage (REST POSE ONLY: this read never tracks the "
+                      "articulation, so it is only comparable right after startup) ---")
+                for name in CAMERA_NAMES:
+                    T = _stage_world_transform(name)
+                    if T is None:
+                        print(f"  [stage] {name}: prim not found")
                         continue
-                    xf = UsdGeom.Xformable(prim)
-                    m = xf.ComputeLocalToWorldTransform(0.0)
-                    t = m.ExtractTranslation()
-                    rot = np.array([[m[i][j] for j in range(3)] for i in range(3)])
-                    look = -rot[2] / (np.linalg.norm(rot[2]) or 1.0)
-                    looks[prim.GetName()] = look
-                    print(f"  [stage] {prim.GetName():14s} path={prim.GetPath()}")
-                    print(f"           world pos={np.round([t[0], t[1], t[2]], 4).tolist()}")
-                    print(f"           look dir ={np.round(look, 3).tolist()}")
-                    print(f"           xform ops="
-                          f"{[op.GetOpName() for op in xf.GetOrderedXformOps()]}")
-                if len(looks) == 3:
-                    print("  --- verdict ---")
-                    for a, b in ((0, 1), (0, 2), (1, 2)):
-                        na, nb = CAMERA_NAMES[a], CAMERA_NAMES[b]
-                        ang = math.degrees(math.acos(
-                            max(-1.0, min(1.0, float(np.dot(looks[na], looks[nb]))))))
-                        print(f"  [stage] {na} vs {nb}: {ang:.1f} deg apart")
+                    print(f"  [stage] {name:14s} rest pos={np.round(T[:3,3],4).tolist()}")
             elif raw.lower() == "kincheck":
                 q = robot.data.joint_pos[0].cpu().numpy()
                 fk_x, fk_y, fk_z, fk_yaw = pf400_fk(q)
@@ -984,9 +1075,14 @@ def run_simulator(
                 print(f"  [kincheck] joints(rail,col,sh,in,out)={np.round(q, 4).tolist()}")
                 print(f"  [kincheck] FK predicts:  x={fk_x:.4f} y={fk_y:.4f} z={fk_z:.4f} "
                       f"yaw={math.degrees(fk_yaw):.2f}deg")
+                from scipy.spatial.transform import Rotation as _R
+                q_ee = robot.data.body_quat_w[0, _ee_idx].cpu().numpy()
+                act_yaw = _R.from_quat([q_ee[1], q_ee[2], q_ee[3], q_ee[0]]).as_euler("xyz")[2]
+                yaw_err = _wrap_deg(math.degrees(fk_yaw) - math.degrees(act_yaw))
                 print(f"  [kincheck] actual EE:    x={actual[0]:.4f} y={actual[1]:.4f} "
-                      f"z={actual[2]:.4f}")
-                print(f"  [kincheck] pos error: {np.linalg.norm([fk_x, fk_y, fk_z] - actual):.4f} m")
+                      f"z={actual[2]:.4f} yaw={math.degrees(act_yaw):.2f}deg")
+                print(f"  [kincheck] pos error: {np.linalg.norm([fk_x, fk_y, fk_z] - actual):.4f} m"
+                      f"   yaw error: {yaw_err:+.2f} deg")
                 all_pos = robot.data.body_pos_w[0].cpu().numpy()
                 for name, pos in zip(robot.body_names, all_pos):
                     print(f"    body {name:12s} pos={np.round(pos, 4).tolist()}")
